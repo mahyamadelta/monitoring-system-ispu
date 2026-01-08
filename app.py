@@ -14,8 +14,8 @@ MQTT_BROKER = "broker.hivemq.com"
 MQTT_PORT = 1883
 MQTT_TOPIC = "project/tralalilo_trolia/sensor"
 
-DEFAULT_LAT = -6.2374
-DEFAULT_LON = 106.9930
+DEFAULT_LAT = -6.2495451129593675
+DEFAULT_LON = 107.01400510003951
 
 # --- SETUP HALAMAN ---
 st.set_page_config(
@@ -265,4 +265,5 @@ with c_graph:
 
 # --- AUTO REFRESH ---
 time.sleep(2)
+
 st.rerun()
