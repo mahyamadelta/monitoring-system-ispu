@@ -17,8 +17,8 @@ BROKER = "broker.hivemq.com"
 PORT = 1883
 TOPIC = "project/tralalilo_trolia/sensor"
 
-DEFAULT_LAT = -6.2374
-DEFAULT_LON = 106.9930
+DEFAULT_LAT = -6.24951875195404
+DEFAULT_LON = 107.01397007764963
 
 # =========================
 # SETUP HALAMAN
@@ -316,3 +316,4 @@ else:
 # Auto Refresh
 time.sleep(2)
 st.rerun()
+
