@@ -1,31 +1,36 @@
 import streamlit as st
-import pandas as pd
 import json
-import uuid
 import time
+import pandas as pd
 import plotly.graph_objects as go
 import plotly.express as px
-from datetime import datetime
 import paho.mqtt.client as mqtt
-import queue  # Library penting untuk Threading
+from datetime import datetime
+import queue 
+import uuid 
+import math # Untuk hitung total halaman
 
-# --- KONFIGURASI UTAMA ---
-MQTT_BROKER = "broker.hivemq.com"
-MQTT_PORT = 1883
-MQTT_TOPIC = "project/tralalilo_trolia/sensor"
+# =========================
+# KONFIGURASI
+# =========================
+BROKER = "broker.hivemq.com"
+PORT = 1883
+TOPIC = "project/tralalilo_trolia/sensor"
 
-DEFAULT_LAT = -6.2495451129593675
-DEFAULT_LON = 107.01400510003951
+DEFAULT_LAT = -6.2374
+DEFAULT_LON = 106.9930
 
-# --- SETUP HALAMAN ---
+# =========================
+# SETUP HALAMAN
+# =========================
 st.set_page_config(
-    page_title="AirQuality Dashboard",
+    page_title="AirQuality Guard IoT",
     page_icon="🍃",
     layout="wide",
     initial_sidebar_state="expanded"
 )
 
-# --- CSS ---
+# Custom CSS
 st.markdown("""
     <style>
     .metric-card {
@@ -38,232 +43,276 @@ st.markdown("""
     </style>
     """, unsafe_allow_html=True)
 
-# --- SHARED QUEUE (Jembatan Thread Aman) ---
-# Kita gunakan cache_resource agar queue ini satu untuk semua
+# =========================
+# SHARED QUEUE (JEMBATAN DATA)
+# =========================
 @st.cache_resource
 def get_data_queue():
     return queue.Queue()
 
 data_queue = get_data_queue()
 
-# --- MQTT CALLBACKS (Dijalankan di Background Thread) ---
-# PENTING: Jangan panggil st.session_state di sini!
-def on_connect(client, userdata, flags, rc):
-    if rc == 0:
-        print(f"✅ MQTT Connected to {MQTT_TOPIC}")
-        client.subscribe(MQTT_TOPIC)
-    else:
-        print(f"❌ Failed to connect: {rc}")
+# =========================
+# SESSION STATE INIT
+# =========================
+if "latest_data" not in st.session_state:
+    st.session_state.latest_data = {}
+if "data_history" not in st.session_state:
+    st.session_state.data_history = []
+
+# --- STATE UNTUK PEREKAMAN ---
+if "recording" not in st.session_state:
+    st.session_state.recording = False
+if "recording_buffer" not in st.session_state:
+    st.session_state.recording_buffer = []
+if "session_id" not in st.session_state:
+    st.session_state.session_id = None
+
+# --- STATE UNTUK PAGINATION TABEL ---
+if "table_page" not in st.session_state:
+    st.session_state.table_page = 0
+
+# =========================
+# MQTT LOGIC (BACKGROUND)
+# =========================
+def on_connect(client, userdata, flags, reason_code, properties):
+    if reason_code == 0:
+        print("✅ Connected to MQTT")
+        client.subscribe(TOPIC)
 
 def on_message(client, userdata, msg):
     try:
-        raw_msg = msg.payload.decode()
-        payload = json.loads(raw_msg)
-        # Tambahkan timestamp saat diterima
+        payload = json.loads(msg.payload.decode())
         payload['timestamp'] = datetime.now()
-        # Masukkan ke antrean (Queue) agar diambil oleh Main Thread
         data_queue.put(payload)
     except Exception as e:
-        print(f"⚠️ Error parsing MQTT: {e}")
+        print("Payload error:", e)
 
-# --- START MQTT ---
 @st.cache_resource
 def start_mqtt_service():
-    client = mqtt.Client()
+    client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2)
     client.on_connect = on_connect
     client.on_message = on_message
     
     try:
-        client.connect(MQTT_BROKER, MQTT_PORT, 60)
-        client.loop_start() # Jalan di background
+        client.connect(BROKER, PORT, 60)
+        client.loop_start()
+        print("🚀 MQTT Thread Started")
     except Exception as e:
-        print(f"Connection Error: {e}")
+        print(f"Connection Failed: {e}")
     return client
 
-client = start_mqtt_service()
+start_mqtt_service()
 
-# --- INISIALISASI STATE (Main Thread) ---
-if "data_buffer" not in st.session_state:
-    st.session_state.data_buffer = []
-if "last_packet" not in st.session_state:
-    st.session_state.last_packet = {
-        "suhu": 0, "kelembaban": 0, "co": 0, "pm25": 0,
-        "no2": 0, "pm10": 0, "so2": 0, "o3": 0,
-        "ai_label": "Menunggu...", "ai_score": 0,
-        "timestamp": datetime.now()
-    }
-if "recording" not in st.session_state:
-    st.session_state.recording = False
-if "session_id" not in st.session_state:
-    st.session_state.session_id = None
-
-# --- PROSES DATA DARI QUEUE (Di Main Thread) ---
-# Ambil semua data yang menumpuk di antrean dan update session_state
+# =========================
+# MAIN THREAD: PROCESS DATA
+# =========================
 while not data_queue.empty():
-    payload = data_queue.get()
-    st.session_state.last_packet = payload
+    new_data = data_queue.get()
+    st.session_state.latest_data = new_data
     
-    # Logika Recording dipindah ke sini (aman)
+    # 1. Update History untuk Grafik Live
+    if not st.session_state.data_history or st.session_state.data_history[-1].get('timestamp') != new_data['timestamp']:
+        st.session_state.data_history.append(new_data)
+        if len(st.session_state.data_history) > 100:
+            st.session_state.data_history.pop(0)
+    
+    # 2. Logika Perekaman (Recording)
     if st.session_state.recording:
-        record = {
-            "timestamp": payload['timestamp'],
-            "session_id": st.session_state.session_id,
-            "suhu": payload.get('suhu', 0),
-            "kelembaban": payload.get('kelembaban', 0),
-            "co": payload.get('co', 0),
-            "pm25": payload.get('pm25', 0),
-            "no2": payload.get('no2', 0),
-            "pm10": payload.get('pm10', 0),
-            "so2": payload.get('so2', 0),
-            "o3": payload.get('o3', 0),
-            "ai_score": payload.get('ai_score', 0),
-            "ai_label": payload.get('ai_label', 'N/A'),
-            "lat": DEFAULT_LAT,
-            "lon": DEFAULT_LON
-        }
-        st.session_state.data_buffer.append(record)
+        record_entry = new_data.copy()
+        record_entry['session_id'] = st.session_state.session_id
+        # Format timestamp agar rapi di tabel
+        record_entry['timestamp'] = record_entry['timestamp'].strftime("%Y-%m-%d %H:%M:%S")
+        st.session_state.recording_buffer.append(record_entry)
 
-# --- HELPER FUNCTIONS ---
-def get_gauge_color(score):
-    if score <= 50: return "#32CD32"
-    elif score <= 100: return "#4169E1"
-    elif score <= 200: return "#FFD700"
-    elif score <= 300: return "#FF4500"
-    else: return "#000000"
+# =========================
+# UI LOGIC
+# =========================
+data = st.session_state.latest_data
 
-def get_recommendation(label):
-    if label == "BAIK": return "✅ Udara Segar! Sangat baik untuk kegiatan luar ruangan."
-    elif label == "SEDANG": return "⚠️ Kualitas sedang. Kelompok sensitif harap waspada."
-    elif label == "TIDAK SEHAT": return "😷 Gunakan masker. Kurangi aktivitas berat di luar."
-    elif label in ["SANGAT TIDAK SEHAT", "SGT TDK SEHAT"]: return "⛔ BAHAYA! Hindari keluar rumah."
-    elif label == "BERBAHAYA": return "☠️ EVAKUASI! Udara beracun."
-    else: return "Menunggu data..."
+def get_gauge_color(score_percent):
+    if score_percent >= 80: return "green"
+    elif score_percent >= 50: return "orange"
+    else: return "red"
 
-# ================= DASHBOARD UI =================
+def get_status_color(label):
+    if label == "BAIK": return "green"
+    if label == "SEDANG": return "blue"
+    if label == "TIDAK SEHAT": return "#FFCC00"
+    if label == "SANGAT TIDAK SEHAT": return "orange"
+    return "red"
 
 # --- SIDEBAR ---
 with st.sidebar:
-    st.title("🎛️ Panel Kontrol")
-    
-    # Indikator sederhana (tidak realtime update icon, tapi cukup)
+    st.title("🎛️ Admin Panel")
     st.success("🟢 MQTT Service Running")
-
     st.markdown("---")
-    st.header("⏺️ Perekaman Data")
     
+    node = st.selectbox("Pilih Perangkat:", ["Node 1 - Terminal Bekasi", "Node 2 - Offline"])
+    
+    st.markdown("### ⏺️ Perekaman Data")
+    
+    # Tombol Start
     if st.button("▶️ Mulai Rekam", type="primary", disabled=st.session_state.recording):
         st.session_state.recording = True
         st.session_state.session_id = str(uuid.uuid4())[:8]
+        st.session_state.recording_buffer = [] # Reset buffer saat mulai baru
+        st.session_state.table_page = 0 # Reset halaman tabel
         st.rerun()
         
-    if st.button("⏹ Stop Rekam", disabled=not st.session_state.recording):
+    # Tombol Stop
+    if st.button("⏹ Hentikan Rekam", disabled=not st.session_state.recording):
         st.session_state.recording = False
         st.rerun()
-        
+    
     if st.session_state.recording:
-        st.info(f"Sedang Merekam... (ID: {st.session_state.session_id})")
+        st.info(f"Merekam... Data: {len(st.session_state.recording_buffer)} baris")
         
-    if st.session_state.data_buffer:
-        df = pd.DataFrame(st.session_state.data_buffer)
-        st.download_button("💾 Download CSV", df.to_csv(index=False), "data_ispu.csv", "text/csv")
+    # Tombol Download
+    if st.session_state.recording_buffer:
+        df_rec = pd.DataFrame(st.session_state.recording_buffer)
+        csv = df_rec.to_csv(index=False).encode('utf-8')
+        st.download_button(
+            label="📥 Download CSV",
+            data=csv,
+            file_name=f"data_rekaman_{st.session_state.session_id}.csv",
+            mime="text/csv"
+        )
 
-# --- HEADER UTAMA ---
-st.title("🍃 AirQuality Guard Dashboard")
-latest = st.session_state.last_packet
-ispu_score = latest.get('ai_score', 0)
-ispu_label = latest.get('ai_label', 'Menunggu...')
+    st.markdown("---")
+    if st.button("🗑️ Hapus Grafik Live"):
+        st.session_state.data_history = []
+        st.rerun()
 
-# --- ROW 1: GAUGE & STATUS ---
-col1, col2 = st.columns([1, 2])
+# --- HEADER ---
+if not data:
+    st.info("📡 Menunggu data MQTT... (Pastikan alat menyala)")
+    time.sleep(2)
+    st.rerun()
 
-with col1:
-    fig = go.Figure(go.Indicator(
+ai_label = data.get("ai_label", "MENUNGGU")
+ai_score = float(data.get("ai_score", 0))
+
+st.title("🌫️ AirQuality Guard Dashboard")
+st.markdown(f"**Lokasi:** {node} | **Update:** {data.get('timestamp').strftime('%H:%M:%S')}")
+
+if ai_label in ["SANGAT TIDAK SEHAT", "BERBAHAYA"]:
+    st.error(f"🚨 PERINGATAN: Kualitas Udara {ai_label}!")
+elif ai_label == "TIDAK SEHAT":
+    st.warning(f"⚠️ PERINGATAN: Kualitas Udara {ai_label}.")
+else:
+    st.success(f"✅ Status Udara: {ai_label}")
+
+# --- ROW 1: PETA & GAUGE ---
+col_map, col_gauge = st.columns([2, 1])
+
+with col_map:
+    st.subheader("📍 Lokasi Real-time")
+    map_data = pd.DataFrame({
+        'lat': [DEFAULT_LAT],
+        'lon': [DEFAULT_LON],
+        'status': [ai_label],
+        'size': [20]
+    })
+    color_map = {"BAIK": "green", "SEDANG": "blue", "TIDAK SEHAT": "orange", "BERBAHAYA": "red"}
+    
+    fig_map = px.scatter_mapbox(
+        map_data, lat="lat", lon="lon", color="status", size="size",
+        color_discrete_map=color_map, zoom=14, height=300
+    )
+    fig_map.update_layout(mapbox_style="open-street-map", margin={"r":0,"t":0,"l":0,"b":0})
+    st.plotly_chart(fig_map, use_container_width=True)
+
+with col_gauge:
+    st.subheader("📊 AI Confidence")
+    fig_gauge = go.Figure(go.Indicator(
         mode = "gauge+number",
-        value = ispu_score,
-        title = {'text': "Skor ISPU"},
+        value = ai_score * 100,
+        title = {'text': f"{ai_label}"},
         gauge = {
-            'axis': {'range': [None, 500]},
-            'bar': {'color': get_gauge_color(ispu_score)},
-            'steps': [
-                {'range': [0, 50], 'color': "lightgreen"},
-                {'range': [50, 100], 'color': "lightblue"},
-                {'range': [100, 200], 'color': "orange"},
-                {'range': [200, 300], 'color': "red"},
-                {'range': [300, 500], 'color': "purple"}
-            ],
+            'axis': {'range': [0, 100]},
+            'bar': {'color': get_gauge_color(ai_score * 100)},
+            'steps': [{'range': [0, 100], 'color': "#f0f2f6"}],
+            'threshold': {'line': {'color': "red", 'width': 4}, 'thickness': 0.75, 'value': 70}
         }
     ))
-    fig.update_layout(height=280, margin=dict(l=20, r=20, t=30, b=20))
-    # Perbaikan Warning: use_container_width dihapus jika error, atau diganti
-    # Streamlit terbaru menyarankan tidak pakai argumen ini jika deprecated, 
-    # tapi kita coba pakai argumen native plotly config di st.plotly_chart jika perlu.
-    # Untuk amannya kita pakai key-word argument khusus jika versi baru.
-    st.plotly_chart(fig, use_container_width=True)
+    fig_gauge.update_layout(height=300, margin=dict(l=20, r=20, t=50, b=20))
+    st.plotly_chart(fig_gauge, use_container_width=True)
 
-with col2:
-    st.markdown(f"### Status: **{ispu_label}**")
+# --- ROW 2: PARAMETER ---
+st.subheader("📈 Parameter Udara")
+tab_lokal, tab_api = st.tabs(["🏠 Sensor Lokal", "☁️ Data API"])
+
+with tab_lokal:
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("CO", f"{data.get('co')} mg/m³")
+    c2.metric("PM 2.5", f"{data.get('pm25')} µg/m³")
+    c3.metric("Suhu", f"{data.get('suhu')} °C")
+    c4.metric("Kelembapan", f"{data.get('kelembaban')} %")
+
+with tab_api:
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("NO₂", f"{data.get('no2')} µg/m³")
+    c2.metric("PM 10", f"{data.get('pm10')} µg/m³")
+    c3.metric("SO₂", f"{data.get('so2')} µg/m³")
+    c4.metric("Ozon", f"{data.get('o3')} µg/m³")
+
+# --- ROW 3: GRAFIK ---
+st.subheader("📉 Tren Real-time")
+if len(st.session_state.data_history) > 1:
+    df_hist = pd.DataFrame(st.session_state.data_history)
+    fig_hist = px.line(df_hist, x='timestamp', y=['co', 'pm25', 'no2'], title="Tren Polutan")
+    st.plotly_chart(fig_hist, use_container_width=True)
+else:
+    st.info("Menunggu data untuk grafik...")
+
+# --- ROW 4: TABEL DATA REKAMAN (NEW FEATURE) ---
+st.markdown("---")
+st.subheader("📋 Log Data Rekaman")
+
+if st.session_state.recording_buffer:
+    df_table = pd.DataFrame(st.session_state.recording_buffer)
     
-    if ispu_label == "BAIK":
-        st.success(get_recommendation(ispu_label))
-    elif ispu_label == "SEDANG":
-        st.info(get_recommendation(ispu_label))
-    elif ispu_label == "TIDAK SEHAT":
-        st.warning(get_recommendation(ispu_label))
-    else:
-        st.error(get_recommendation(ispu_label))
-        
-    ts_str = latest.get('timestamp')
-    if isinstance(ts_str, datetime):
-        ts_str = ts_str.strftime("%H:%M:%S")
-    st.caption(f"Update Terakhir: {ts_str}")
+    # Konfigurasi Pagination
+    ITEMS_PER_PAGE = 10
+    total_items = len(df_table)
+    total_pages = math.ceil(total_items / ITEMS_PER_PAGE)
+    
+    # Tombol Navigasi
+    col_prev, col_page, col_next = st.columns([1, 2, 1])
+    
+    with col_prev:
+        if st.button("⬅️ Sebelumnya"):
+            if st.session_state.table_page > 0:
+                st.session_state.table_page -= 1
+                st.rerun()
+                
+    with col_next:
+        if st.button("Selanjutnya ➡️"):
+            if st.session_state.table_page < total_pages - 1:
+                st.session_state.table_page += 1
+                st.rerun()
+                
+    with col_page:
+        st.write(f"Halaman **{st.session_state.table_page + 1}** dari **{total_pages}** (Total: {total_items} data)")
 
-# --- BARIS 2: KARTU PARAMETER ---
-st.subheader("📊 Detail Parameter")
-tab1, tab2 = st.tabs(["🏠 Sensor Lokal", "☁️ Data Wilayah (API)"])
+    # Slicing Data (Urutan Terbaru di Atas)
+    df_table = df_table.sort_index(ascending=False).reset_index(drop=True)
+    start_idx = st.session_state.table_page * ITEMS_PER_PAGE
+    end_idx = start_idx + ITEMS_PER_PAGE
+    
+    # Tampilkan Tabel
+    st.dataframe(
+        df_table.iloc[start_idx:end_idx], 
+        use_container_width=True,
+        column_config={
+            "timestamp": "Waktu",
+            "session_id": "ID Sesi"
+        }
+    )
+else:
+    st.info("Belum ada data yang direkam. Klik 'Mulai Rekam' di sidebar untuk mengumpulkan data.")
 
-with tab1:
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Suhu", f"{latest.get('suhu', 0)} °C")
-    c2.metric("Kelembapan", f"{latest.get('kelembaban', 0)} %")
-    c3.metric("CO", f"{latest.get('co', 0)} mg/m³")
-    c4.metric("PM 2.5", f"{latest.get('pm25', 0)} µg/m³")
-
-with tab2:
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("NO₂", f"{latest.get('no2', 0)} µg/m³")
-    c2.metric("PM 10", f"{latest.get('pm10', 0)} µg/m³")
-    c3.metric("SO₂", f"{latest.get('so2', 0)} µg/m³")
-    c4.metric("O₃", f"{latest.get('o3', 0)} µg/m³")
-
-# --- BARIS 3: PETA & GRAFIK ---
-c_map, c_graph = st.columns([1, 1])
-
-with c_map:
-    st.subheader("📍 Lokasi Alat")
-    map_data = pd.DataFrame({
-        'lat': [DEFAULT_LAT], 
-        'lon': [DEFAULT_LON],
-        'ispu': [ispu_score]
-    })
-    # Perbaikan Warning: width="stretch" tidak ada di st.map versi lama, 
-    # tapi use_container_width=True masih umum. Jika error, gunakan parameter width integer.
-    # Kita coba ikuti warning user:
-    try:
-        st.map(map_data, size=20, color="#FF0000", zoom=14, use_container_width=True)
-    except:
-        # Fallback jika parameter dihapus total
-        st.map(map_data, size=20, color="#FF0000", zoom=14)
-
-with c_graph:
-    st.subheader("📈 Tren Real-time")
-    if st.session_state.data_buffer:
-        df_chart = pd.DataFrame(st.session_state.data_buffer)
-        fig_chart = px.line(df_chart, x='timestamp', y=['co', 'pm25'], title="Tren Polutan Lokal")
-        st.plotly_chart(fig_chart, use_container_width=True)
-    else:
-        st.info("Mulai perekaman untuk melihat grafik.")
-
-# --- AUTO REFRESH ---
+# Auto Refresh
 time.sleep(2)
-
 st.rerun()
